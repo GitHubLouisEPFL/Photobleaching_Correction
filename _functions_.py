@@ -560,7 +560,7 @@ def personalized_fixed_simulator(image, tau_map, nb_images, poisson_scale_factor
 
     # if tau_map and amplitude_map are scalars, convert to numpy arrays
     if isinstance(tau_map, (int, float)):
-        tau_map = np.ones(image.shape) * tau_map
+        tau_map = np.where(image <= 100, 10000, tau_map)
 
     # check if the image and the maps have the same size
     assert image.shape == tau_map.shape, "The image and the tau map must have the same size"
@@ -582,7 +582,8 @@ def personalized_fixed_simulator(image, tau_map, nb_images, poisson_scale_factor
 
 def photobleaching_simulator(image, tau_map, nb_images, speed_level = 5, sigma = 5, poisson_scale_factor=1, gaussian_noise_level=0.05*4095):
     '''
-    Simulate microscopy images for an object that is not moving. Each pixel has its own time constant.
+    Simulate microscopy images for an object that is moving, following rigid movements. Time constant can be either a scalar, in which case
+    it will be the same for all pixels, or a 2D array, with a specific time constant for each pixel.
 
     Input:
         image : the clean grayscale image (numpy array), encoded in 16 bits, but values between 0 and 4095
@@ -632,6 +633,7 @@ def photobleaching_simulator(image, tau_map, nb_images, speed_level = 5, sigma =
         current_clean_frame = move(decaying_signal, angle, speed_level)
         current_noisy_frame = move(poisson_and_gauss, angle, speed_level)
         reference_frame = move(reference_frame, angle, speed_level)
+        tau_map = move(tau_map, angle, speed_level)
 
         ground_truth[i] = current_clean_frame
         array_simulated_images[i] = current_noisy_frame
@@ -640,10 +642,11 @@ def photobleaching_simulator(image, tau_map, nb_images, speed_level = 5, sigma =
 
 
 
+
 def curve2fit(x,a,b):
     return a * np.exp((-1/b)*x)
 
-def exponential_fit(simulation_array, t0=0, time_step=1):
+def exponential_fit(simulation_array, p0=[4095, 10], real_data=False, _mean_background=300, tau_max=100, t0=0, time_step=1):
     '''
     Fit an exponential decay to each pixel of a of a sequence of images, and return the time constant and the amplitude for each pixel.
     The background's time constant is set to 100 and the amplitude to 100 as well.
@@ -657,6 +660,9 @@ def exponential_fit(simulation_array, t0=0, time_step=1):
         tau_map : the time constant map (2D numpy array)
         signal : the amplitude map (2D numpy array)
     '''
+    if type(simulation_array) == list:
+        simulation_array = list_to_array(simulation_array)
+
     t = np.arange(t0, simulation_array.shape[0], time_step)
     y = np.zeros(len(t))
     tau_map = np.zeros((simulation_array.shape[1], simulation_array.shape[2]))
@@ -667,14 +673,27 @@ def exponential_fit(simulation_array, t0=0, time_step=1):
 
             for time in range(len(t)):
                 y[time] = simulation_array[time][i][j]
-            
-            if (i==128) and (j==128):
-                plt.plot(y)
 
-            if(np.mean(y) > 300):
+            estimated_amplitude = np.max(y)
 
-                p0=[4095, 10]
-                popt, _ = curve_fit(curve2fit, t, y, p0=p0, maxfev=10000)
+            if y[0]>0.2:
+                denom = np.log(y[-1]/y[0])
+            else:
+                denom=0
+
+            if denom!=0:
+                estimated_tau = -len(y)/denom
+            else:
+                estimated_tau = 0.1
+
+            p0 = [estimated_amplitude, estimated_tau]
+
+            if(np.mean(y) > _mean_background):
+
+                if estimated_tau>0.1:
+                    popt, _ = curve_fit(curve2fit, t, y, p0=p0, maxfev=10000)
+                else:
+                    popt = (np.max(y), 0.1) 
                 a, tau_fit = popt
                 amplitude = a
 
@@ -683,9 +702,27 @@ def exponential_fit(simulation_array, t0=0, time_step=1):
 
             else:
 
-                tau_map[i, j] = 100
-                signal[i, j] = 100
+                if real_data:
+                    tau_map[i, j] = tau_max
+                    signal[i, j] = _mean_background/2
 
+                else:
+                    tau_map[i, j] = tau_max
+                    signal[i, j] = 100
+
+    if real_data:
+        tau_map[tau_map>tau_max]=tau_max
+        tau_map[tau_map<0]= tau_max
+        tau_map[np.isnan(tau_map)] = tau_max
+        signal[signal>np.max(simulation_array)] = np.max(simulation_array)
+        signal[signal<0] = 0
+    
+    else:
+        tau_map[tau_map>100]=tau_max
+        tau_map[tau_map<0]= tau_max
+        tau_map[np.isnan(tau_map)] = tau_max
+        signal[signal>4095] = 4095
+        signal[signal<0] = 0
 
     return tau_map, signal
 
@@ -817,7 +854,7 @@ def moving_object(image, nb_images, speed_level, sigma=30):
     return list_moving_images
 
 
-def define_variable_taus(img_4_points, tau1, tau2, tau3, tau4):
+def define_variable_taus(img_4_points, tau1, tau2, tau3, tau4, default_threshold=500):
 
     tau_map = np.zeros((img_4_points.shape[0], img_4_points.shape[1]))
 
@@ -825,28 +862,28 @@ def define_variable_taus(img_4_points, tau1, tau2, tau3, tau4):
         for j in range(img_4_points.shape[1]):
             # four quadrants
             if i < img_4_points.shape[0]//2 and j < img_4_points.shape[1]//2:
-                if img_4_points[i,j] > 500:
+                if img_4_points[i,j] > default_threshold:
                     tau_map[i,j] = tau1
                 else:
-                    tau_map[i,j] = 100
+                    tau_map[i,j] = 10000
 
             elif i < img_4_points.shape[0]//2 and j >= img_4_points.shape[1]//2:
-                if img_4_points[i,j] > 500:
+                if img_4_points[i,j] > default_threshold:
                     tau_map[i,j] = tau2
                 else:
-                    tau_map[i,j] = 100
+                    tau_map[i,j] = 10000
 
             elif i >= img_4_points.shape[0]//2 and j < img_4_points.shape[1]//2:
-                if img_4_points[i,j] > 500:
+                if img_4_points[i,j] > default_threshold:
                     tau_map[i,j] = tau3
                 else:
-                    tau_map[i,j] = 100
+                    tau_map[i,j] = 10000
 
             else:
-                if img_4_points[i,j] > 500:
+                if img_4_points[i,j] > default_threshold:
                     tau_map[i,j] = tau4
                 else:
-                    tau_map[i,j] = 100
+                    tau_map[i,j] = 10000
 
     return tau_map
 
@@ -869,31 +906,77 @@ def show_image(image, vmin=100, vmax=4095, colorbar=False):
     plt.axis('off')
     plt.show()
 
-def update_frame(num, image_list, im):
+def update_frame(num, image_list, im, vmin, vmax):
     im.set_array(image_list[num])
-    im.set_clim(vmin=0, vmax=4095)  # Update color limits for each frame
+    im.set_clim(vmin=vmin, vmax=vmax)  # Update color limits for each frame
     return im,
 
-def show_simulation(list_simu, vmin=0, vmax=4095):
+def show_simulation(list_simu, vmin=None, vmax=None):
     '''
     Show a simulation as an animation
     '''
+
+    if type(list_simu) == list:
+        list_simu = list_to_array(list_simu)
+
+    if vmin==None or vmax==None:
+        vmin = np.min(list_simu)
+        vmax = np.max(list_simu)
 
     # Initialize the figure
     fig = plt.figure()
 
     # Initialize the image object
-    im = plt.imshow(list_simu[0], cmap='gray', vmin=0, vmax=4095)
+    # im = plt.imshow(list_simu[0], cmap='gray', vmin=vmin, vmax=vmax)
+    # plt.close()
+
+    im = plt.imshow(list_simu[0], cmap='gray', vmin=vmin, vmax=vmax)
+    plt.colorbar()
     plt.close()
 
     # Create the animation
-    ani = animation.FuncAnimation(fig, update_frame, frames=len(list_simu), fargs=(list_simu, im), blit=True)
+    ani = animation.FuncAnimation(fig, update_frame, frames=len(list_simu), fargs=(list_simu, im, vmin, vmax), blit=True)
 
     # Convert the animation to HTML
     html_video = ani.to_jshtml()
 
     return HTML(html_video)
 
+#-----------------------------------------------Photobleaching correction-------------------------------------------------#
+
+# def correct_photobleaching_fixed_framework(denoised_images, tau_map): 
+
+#     t = np.arange(0, len(denoised_images), 1).reshape(-1, 1, 1)
+#     exponential_factor = np.exp(t/tau_map)
+#     corrected_simulation = denoised_images*exponential_factor
+
+#     return corrected_simulation
+
+def correct_photobleaching_fixed_framework(denoised_images, tau_map): 
+    # Create the time array
+    t = np.arange(0, len(denoised_images), 1).reshape(-1, 1, 1)
+    
+    # Create a mask where tau_map is zero
+    zero_tau_map_mask = (tau_map == 0)
+    
+    # Set the exponential factor to the max value where tau_map is zero
+    tau_map = np.where(zero_tau_map_mask, 0.1, tau_map)
+
+    # Calculate the exponential factor
+    exponential_factor = np.exp(t / tau_map)
+    
+    # Apply the exponential factor to denoised images
+    corrected_simulation = denoised_images * exponential_factor
+
+    return corrected_simulation
+
+
+def mean_background(y_pixel, x_pixel, _3Darray, plot=False):
+    if type(_3Darray) == list:
+        _3Darray = list_to_array(_3Darray)
+    if plot:
+        plt.plot(_3Darray[:,y_pixel, x_pixel])
+    return np.mean(_3Darray[:,y_pixel, x_pixel])
 
 #-----------------------------------------------Useful functions-------------------------------------------------#
 
@@ -939,3 +1022,50 @@ def get_var_name(var):
     for name, value in locals().items():
         if value is var:
             return name
+        
+def change_array_type(array, new_type):
+    return array.astype(new_type)
+        
+
+def tau_amp_estimates(simulation_array, vmax_tau=None, vmax_amp=None, t0=0, time_step=1):
+    '''
+    Find the maximum estimated tau value for a given simulation array.
+    '''
+    if type(simulation_array) == list:
+        simulation_array = list_to_array(simulation_array)
+
+    t = np.arange(t0, simulation_array.shape[0], time_step)
+    y = np.zeros(len(t))
+
+    estimations_tau = np.zeros((simulation_array.shape[1], simulation_array.shape[2]))
+    estimations_amp = np.zeros((simulation_array.shape[1], simulation_array.shape[2]))
+
+    for i in range(simulation_array.shape[1]):
+        for j in range(simulation_array.shape[2]):
+
+            for time in range(len(t)):
+                y[time] = simulation_array[time][i][j]
+
+            estimated_amplitude = np.max(y)
+            estimated_tau = -len(y)/np.log(y[-1]/y[0])
+            estimations_tau[i][j] = estimated_tau
+            estimations_amp[i][j] = estimated_amplitude
+
+    if vmax_tau==None:
+        vmax_tau=np.max(estimations_tau)
+
+    estimations_tau[estimations_tau<0]=0
+
+    plt.imshow(estimations_tau, vmin=0, vmax=vmax_tau)
+    plt.colorbar()
+    plt.show()
+
+
+
+    if vmax_amp==None:
+        vmax_amp=np.max(estimations_amp)
+
+    estimations_amp[estimations_amp<0]=0
+    plt.imshow(estimations_amp, vmin=0, vmax=vmax_amp)
+    plt.colorbar()
+    plt.show()
